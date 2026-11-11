@@ -224,7 +224,6 @@ Each switch is one `if` at the exact spot it guards, marked `test-only switch`, 
 - No epoch or chain-reorganisation handling beyond RETRACT.
 - No auth, no UI, no metrics backend. (`demo/` is a testing aid, described under "The test".)
 
-## More detail
+## Architecture note
 
-- [doc/FLOW.md](doc/FLOW.md): how a test round flows, from delivery through the two instances to the endpoints.
-- [doc/PROTECTIONS.md](doc/PROTECTIONS.md): a walkthrough of the six protections and what breaks without each one.
+[doc/architecture-note.pdf](doc/architecture-note.pdf) (2 pages): the data model, ordering, duplicates and retraction, the most likely production failure, the 1000x plan, what was not built, and the answers to Parts A and B.
