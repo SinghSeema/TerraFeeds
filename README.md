@@ -18,7 +18,7 @@ Postgres is published on host port `55432`, not 5432, so it does not clash with 
 
 ```
 curl -XPOST localhost:3000/events -H 'content-type: application/json' \
-  -d '{"eventId":"e1","type":"TRANSFER","height":1,"assetId":"FUND-A","from":null,"to":"alice","units":1000}'
+  -d '{"eventId":"e1","height":1,"assetId":"FUND-A","from":null,"to":"alice","units":1000}'
 # {"outcome":"accepted"}      possible outcomes: accepted | duplicate | replaced | conflict | applied | rejected
 
 curl -XPOST localhost:3000/events -H 'content-type: application/json' \
@@ -164,7 +164,7 @@ Each switch is one `if` at the exact spot it guards, marked `test-only switch`, 
 
 ## Open decisions
 
-- **Message format.** Not specified anywhere, so I chose `{eventId, type: TRANSFER|RETRACT, height, assetId, from|null, to, units, fromHeight}`.
+- **Message format.** Exactly the feed's two shapes. A transfer has no `type` field: `{eventId, height, assetId, from, to, units}`. A retraction is `{eventId, type: "RETRACT", fromHeight}`. Any other `type` is rejected with 400.
 - **`highest_seen`** is refreshed by the drain, both when it applies an event and when it stops, and by retraction. Ingest stays insert-only. If it were refreshed only on apply, it would never move at a gap and the lag alert could not fire.
 - **A retraction that finds nothing in range** still succeeds and rewinds nothing.
 - **Units** are integers (`bigint`) end to end.

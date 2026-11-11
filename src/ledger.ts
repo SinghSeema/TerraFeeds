@@ -46,7 +46,8 @@ function parseMessage(m: any): Event {
   const eventId = str(m?.eventId, 'eventId');
   const none = { height: null, assetId: null, from: null, to: null, units: null, fromHeight: null };
   if (m.type === 'RETRACT') return { ...none, eventId, kind: 'retract', fromHeight: int(m.fromHeight, 'fromHeight') };
-  if (m.type !== 'TRANSFER') throw new BadMessage('type must be TRANSFER or RETRACT');
+  // The feed's transfer shape has no type field; only a retraction carries one.
+  if (m.type !== undefined) throw new BadMessage('type must be absent (transfer) or RETRACT');
   const units = int(m.units, 'units');
   if (units === 0n) throw new BadMessage('units must be positive');
   return {

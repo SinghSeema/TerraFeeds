@@ -23,7 +23,7 @@ async function resetDb(genesis = 0n, protections: Partial<Protections> = {}) {
 }
 
 const transfer = (height: number, from: string | null, to: string, units: number, assetId = 'X', eventId = `e${height}`) =>
-  ({ eventId, type: 'TRANSFER', height, assetId, from, to, units });
+  ({ eventId, height, assetId, from, to, units });
 const retract = (fromHeight: number, eventId = `r${fromHeight}`) => ({ eventId, type: 'RETRACT', fromHeight });
 
 async function status(eventId: string) {
