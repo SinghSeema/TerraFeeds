@@ -97,6 +97,31 @@ To replay the gap demo from the plan, start the API with `GENESIS_FRONTIER=4470 
 - lag and stall alerts;
 - the finalized/provisional split at the `frontier - 12` boundary.
 
+**Production vs test.** The test drives the same `Ledger` code the API runs. It delivers messages by calling it directly instead of over HTTP, and replaces the queue with its own workers. The final results are read through the real HTTP routes:
+
+```
+PRODUCTION                                      TEST (npm test)
+──────────                                      ───────────────
+queue / client                                  test process (vitest)
+     │ HTTP POST /events                         ├─ builds the feed from a seed
+     ▼                                           ├─ 8 workers deliver shuffled, duplicated jobs
+server.ts  (Fastify, routes only)                │      │ direct calls: ingest(), drain()
+     │ ledger.ingest(), ledger.holders() ...     │      ▼
+     ▼                                           ├─ Ledger instance 1 ─┐  each with its own pool,
+ledger.ts  (all the logic)  ◄──── same code ───► ├─ Ledger instance 2 ─┤  like two servers
+     │  one pool per instance                    │                     ▼
+     ▼                                           │      Postgres (ledger_test database)
+Postgres (ledger database)                       │
+                                                 ├─ reader loop: invariant checks during the run
+                                                 └─ final check: GET both endpoints through the
+                                                    real routes (app.inject), compared with the oracle
+```
+
+- **Why skip HTTP for delivery.** `server.ts` has no shared state, locks or logic: every route is a single call into `ledger.ts`. All the concurrency risk is in database transactions, and the test exercises those for real.
+- **The endpoints are still tested.** `server.ts` exports `buildApp()`, and the final check sends real `GET` requests through it with Fastify's `inject()`. That runs the full routing and JSON serialisation, without a network socket.
+- **What the direct calls allow.** The test can hold a transaction open at its commit point, switch protections off, and run two instances in one process.
+- **Why two instances in one process is valid.** To Postgres, two `Ledger` objects with separate pools are indistinguishable from two servers: separate sessions competing for the same locks and rows.
+
 **The concurrency scenario** races a retraction against shuffled, duplicated delivery by 8 workers split across two service instances, each with its own pool. It is the most dangerous case because it combines every rule at once, and it fails silently: a resurrected or double-applied event yields a balance that looks plausible but is wrong. The feed is generated from a seed:
 - 40 heights across 3 assets and 6 investors;
 - a RETRACT inside the provisional window;
@@ -114,7 +139,8 @@ A reader loop checks invariants throughout, through the endpoint handlers:
 
 The final state must also satisfy:
 - `finalized + provisional` equals the stored balance for every holder;
-- it matches a single-threaded oracle: holdings, issued supply, frontier, and every event's status.
+- it matches a single-threaded oracle: holdings, issued supply, frontier, and every event's status;
+- `GET /assets/{assetId}/holders` and `GET /investors/{investorId}/positions` return exactly what the oracle expects for every asset and investor. That covers every field: the finalized/provisional split, `appliedThrough`, `gapAt` and `waitingCount`.
 
 **Must-fail proofs.** The scenario then reruns with each protection switched off, for up to `ROUNDS` (25) seeds, and asserts that at least one round breaks:
 

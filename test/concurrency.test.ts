@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { isDeepStrictEqual } from 'node:util';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPool, migrate } from '../src/db.js';
 import { ALL_PROTECTIONS, Ledger, type Hooks, type Protections } from '../src/ledger.js';
+import { buildApp } from '../src/server.js';
 
 const print = console.log.bind(console); // the service's own log lines are muted below; test evidence is not
 
@@ -240,12 +242,34 @@ function oracle(f: Feed) {
   for (const m of f.originals) statuses.set(m.eventId, m.height < f.fromHeight ? 'applied' : 'retracted');
   for (const m of f.corrected) statuses.set(m.eventId, 'waiting');
   let frontier = 0;
+  const applied: Msg[] = [];
   for (const m of [...f.originals.filter((m) => m.height < f.fromHeight), ...f.corrected]) {
     if (!applyTo(holdings, supply, m)) break;
     frontier = m.height;
+    applied.push(m);
     statuses.set(m.eventId, 'applied');
   }
-  return { holdings, supply, statuses, frontier };
+
+  // Expected endpoint responses. Finalized = the effect of applied events at height <= frontier - 12.
+  const finalized = new Map<string, bigint>();
+  applied.filter((m) => m.height <= frontier - 12).forEach((m) => applyTo(finalized, new Map(), m));
+  const waitingCount = [...statuses.values()].filter((s) => s === 'waiting').length;
+  const header = { appliedThrough: String(frontier), gapAt: waitingCount ? String(frontier + 1) : null, waitingCount };
+  const figures = (key: string) => {
+    const fin = finalized.get(key) ?? 0n;
+    const provisional = (holdings.get(key) ?? 0n) - fin;
+    return fin === 0n && provisional === 0n ? null : { finalized: String(fin), provisional: String(provisional) };
+  };
+  const endpoints = new Map<string, object>();
+  for (const assetId of ASSETS) {
+    const holders = INVESTORS.flatMap((investorId) => { const x = figures(`${assetId}/${investorId}`); return x ? [{ investorId, ...x }] : []; });
+    endpoints.set(`/assets/${assetId}/holders`, { assetId, issuedSupply: String(supply.get(assetId) ?? 0n), ...header, holders });
+  }
+  for (const investorId of INVESTORS) {
+    const positions = ASSETS.flatMap((assetId) => { const x = figures(`${assetId}/${investorId}`); return x ? [{ assetId, ...x }] : []; });
+    endpoints.set(`/investors/${investorId}/positions`, { investorId, ...header, positions });
+  }
+  return { holdings, supply, statuses, frontier, endpoints };
 }
 
 // Invariants read through the endpoint handlers, each a single consistent snapshot.
@@ -378,6 +402,16 @@ async function runScenario(seed: number, protections: Partial<Protections>, pool
       if (x.finalized + x.provisional !== balance) problems.add(`finalized + provisional != balance for ${assetId}/${x.investorId}`);
     }
   }
+  // Both read endpoints through the real HTTP routes (in-process, no socket): every field, including the
+  // finalized/provisional split, must equal the oracle's.
+  const app = buildApp(inst[0], false);
+  for (const [url, expected] of want.endpoints) {
+    const res = await app.inject({ method: 'GET', url });
+    if (res.statusCode !== 200 || !isDeepStrictEqual(JSON.parse(res.body), expected)) {
+      problems.add(`endpoint GET ${url}: expected ${JSON.stringify(expected)}, got ${res.statusCode} ${res.body}`);
+    }
+  }
+  await app.close();
   return [...problems];
 }
 
