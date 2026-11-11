@@ -1,4 +1,4 @@
-# TerraStakes Ledger
+# Ownership Ledger Service
 
 This service records who owns what. It reads a settlement feed that arrives out of order, may deliver the same message more than once, and can retract events it already sent. The ledger never pays out on a balance that a retraction or a duplicate could change.
 
