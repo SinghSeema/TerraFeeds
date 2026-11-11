@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledger Test Console</title>
+<style>
+/* Layout: control column on the left, live ledger views and a request log on the right.
+   Tab A is teal (live API), tab B is indigo (test results). Status colors are separate from the tab accent. */
+:root {
+  --bg: #f3f5f8; --panel: #ffffff; --panel-2: #f7f9fb; --line: #e1e6ed; --fg: #142031; --muted: #5c6878; --faint: #8b96a4;
+  --a: #0d9488; --a-soft: #d5f5f0; --b: #4f46e5; --b-soft: #e3e5ff;
+  --ok: #15803d; --ok-bg: #dcf7e5; --warn: #a35a06; --warn-bg: #fdf0cf; --bad: #b42323; --bad-bg: #fde3e3;
+  --neutral: #4a5768; --neutral-bg: #e7ecf2;
+  --get: #1d4ed8; --get-bg: #dce7fe; --post: #9a3412; --post-bg: #feeadb;
+  --fin: #16a34a; --prov: #e8960c;
+  --term-bg: #0e1626; --term-fg: #d6deea; --term-dim: #7a879a;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  --accent: var(--a); --accent-soft: var(--a-soft);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d121a; --panel: #151c27; --panel-2: #111823; --line: #263142; --fg: #e3e9f1; --muted: #9aa6b6; --faint: #6f7c8e;
+    --a: #2dd4bf; --a-soft: #11332f; --b: #8b8cf8; --b-soft: #23244a;
+    --ok: #4ade80; --ok-bg: #12301f; --warn: #fbbf24; --warn-bg: #3a2c0c; --bad: #f87171; --bad-bg: #3d1717;
+    --neutral: #b4c0cf; --neutral-bg: #222c3a;
+    --get: #93b4fb; --get-bg: #172644; --post: #fdba8c; --post-bg: #3b2213;
+    --fin: #34d399; --prov: #f5b13d;
+    --term-bg: #080c13; color-scheme: dark;
+  }
+}
+body.tab-b { --accent: var(--b); --accent-soft: var(--b-soft); }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 var(--sans); }
+button, select, input { font: inherit; color: inherit; }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+
+/* Header */
+.top { background: var(--panel); border-top: 3px solid var(--accent); border-bottom: 1px solid var(--line);
+  padding: 12px 24px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.logo { width: 36px; height: 36px; border-radius: 8px; background: var(--accent); color: var(--panel);
+  display: grid; place-items: center; font: 700 14px var(--mono); letter-spacing: -.5px; }
+.brand h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
+.brand p { margin: 0; color: var(--muted); font-size: 12.5px; }
+.status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px;
+  padding: 3px 10px 3px 8px; font-size: 12.5px; color: var(--muted); background: var(--panel-2); }
+.pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.pill.up i { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-bg); }
+.pill.down i { background: var(--bad); }
+.pill.up { color: var(--fg); }
+#busy { font-size: 12.5px; color: var(--accent); font-weight: 600; }
+#busy:empty { display: none; }
+#busy::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px;
+  border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Tabs */
+.tabs { display: flex; gap: 0; padding: 0 24px; background: var(--panel); border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tab { border: 0; background: none; padding: 12px 18px 10px; cursor: pointer; border-bottom: 3px solid transparent;
+  display: flex; align-items: baseline; gap: 8px; color: var(--muted); white-space: nowrap; }
+.tab b { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; font-size: 12px;
+  background: var(--neutral-bg); color: var(--neutral); }
+.tab span { font-size: 12px; color: var(--faint); }
+.tab strong { font-weight: 600; }
+.tab[data-tab="a"][aria-selected="true"] { color: var(--fg); border-bottom-color: var(--a); }
+.tab[data-tab="a"][aria-selected="true"] b { background: var(--a); color: var(--panel); }
+.tab[data-tab="b"][aria-selected="true"] { color: var(--fg); border-bottom-color: var(--b); }
+.tab[data-tab="b"][aria-selected="true"] b { background: var(--b); color: var(--panel); }
+.tab:focus-visible, .btn:focus-visible, .step:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Legend */
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 10px 24px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+.sw.fin { background: var(--fin); }
+.sw.prov { background: repeating-linear-gradient(135deg, var(--prov) 0 3px, transparent 3px 6px); border: 1px solid var(--prov); }
+
+/* Layout */
+.layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 20px; padding: 20px 24px 40px; align-items: start; }
+@media (max-width: 1050px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+.card > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 16px;
+  border-bottom: 1px solid var(--line); }
+.card > header h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+.card > header h2 small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+.card > header .when { font-size: 11.5px; color: var(--faint); }
+.card .body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.hint { margin: 0; color: var(--muted); font-size: 12.5px; }
+.eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+
+/* Buttons */
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 7px; padding: 7px 12px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+.btn.danger { color: var(--bad); }
+.btn.danger:hover:not(:disabled) { border-color: var(--bad); background: var(--bad-bg); }
+.btn:disabled, .step:disabled { opacity: .5; cursor: progress; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.row > select, .row > input { border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; background: var(--panel); }
+.row > input { width: 90px; }
+label.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.m { font: 700 10.5px var(--mono); padding: 2px 6px; border-radius: 4px; letter-spacing: .03em; }
+.m.GET { background: var(--get-bg); color: var(--get); }
+.m.POST { background: var(--post-bg); color: var(--post); }
+.readbtn { justify-content: flex-start; width: 100%; font-family: var(--mono); font-size: 12px; }
+
+/* Steps */
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.step { width: 100%; text-align: left; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 10px; align-items: start;
+  border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 9px 10px; cursor: pointer; }
+.step:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+.step .num { font: 600 12px var(--mono); color: var(--accent); padding-top: 1px; }
+.step b { display: block; font-weight: 600; font-size: 13px; }
+.step small { display: block; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.step .tag { display: inline-block; margin-top: 4px; font: 500 10.5px var(--mono); color: var(--faint); }
+.step .res { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.step .exp { font-size: 10.5px; color: var(--faint); white-space: nowrap; }
+.step.done { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.step.miss { border-color: color-mix(in srgb, var(--bad) 50%, var(--line)); }
+
+/* Badges */
+.badge { display: inline-flex; align-items: center; gap: 4px; font: 600 11px var(--mono); padding: 2px 7px; border-radius: 5px; white-space: nowrap; }
+.ok { background: var(--ok-bg); color: var(--ok); }
+.warn { background: var(--warn-bg); color: var(--warn); }
+.bad { background: var(--bad-bg); color: var(--bad); }
+.neutral { background: var(--neutral-bg); color: var(--neutral); }
+
+/* Scenario box */
+.scen { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; font-size: 12.5px; }
+.scen dt { color: var(--muted); }
+.scen dd { margin: 0; font-family: var(--mono); }
+.alert-box { border-radius: 8px; padding: 9px 12px; font-size: 12.5px; }
+.alert-box:empty { display: none; }
+
+/* Views */
+.views { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.views .wide { grid-column: 1 / -1; }
+@media (max-width: 760px) { .views { grid-template-columns: minmax(0, 1fr); } }
+.empty { color: var(--faint); font-size: 12.5px; padding: 18px 0; text-align: center; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--line); border-radius: 7px; padding: 4px 9px; background: var(--panel-2); display: flex; flex-direction: column; min-width: 0; }
+.chip span { font-size: 10.5px; color: var(--muted); letter-spacing: .02em; }
+.chip strong { font: 600 14px var(--mono); font-variant-numeric: tabular-nums; }
+.chip.ok, .chip.warn, .chip.bad { border-color: transparent; }
+.chip.ok span, .chip.warn span, .chip.bad span { color: inherit; opacity: .8; }
+.tbl { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+  padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); }
+td { padding: 7px 8px 7px 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+td.n, th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td.fin { color: var(--fin); }
+td.prov { color: var(--prov); }
+td.neg { color: var(--bad); }
+tfoot td { border-bottom: 0; font-weight: 600; }
+.bar { height: 8px; width: 100%; min-width: 60px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; display: flex; overflow: hidden; }
+.bar i { display: block; height: 100%; }
+.bar i.fin { background: var(--fin); }
+.bar i.prov { background: repeating-linear-gradient(135deg, var(--prov) 0 3px, transparent 3px 6px); }
+.check { font-size: 12.5px; padding: 6px 10px; border-radius: 7px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.tile { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2); }
+.tile span { display: block; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.tile strong { font: 600 20px var(--mono); font-variant-numeric: tabular-nums; }
+.tile.bad strong { color: var(--bad); }
+.tile.warn strong { color: var(--warn); }
+.group { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px; align-items: start; font-size: 12.5px; }
+.group > span { color: var(--muted); padding-top: 2px; }
+details.raw summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+pre { margin: 6px 0 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px;
+  overflow: auto; max-height: 320px; font: 12px/1.5 var(--mono); }
+
+/* Terminal */
+.term { background: var(--term-bg); color: var(--term-fg); border-radius: 0 0 10px 10px; padding: 12px 16px; font: 12px/1.55 var(--mono);
+  max-height: 380px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.term .dim { color: var(--term-dim); }
+.term .g { color: #4ade80; }
+.term .r { color: #f87171; }
+.term .y { color: #fbbf24; }
+.term .c { color: #7dd3fc; }
+.banner { padding: 10px 16px; font-size: 13px; font-weight: 600; border-bottom: 1px solid var(--line); }
+
+/* Log */
+.log-list { display: flex; flex-direction: column; }
+.entry { border-top: 1px solid var(--line); padding: 10px 16px; display: flex; flex-direction: column; gap: 4px; }
+.entry:first-child { border-top: 0; }
+.entry .line1 { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.entry .url { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.entry .meta { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--faint); }
+.entry .label { font-size: 12.5px; color: var(--muted); }
+.entry .target { font: 600 10.5px var(--mono); padding: 1px 6px; border-radius: 4px; color: var(--panel); }
+.entry .target.a { background: var(--a); }
+.entry .target.b { background: var(--b); }
+.entry details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.entry .cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 760px) { .entry .cols { grid-template-columns: minmax(0, 1fr); } }
+.entry h4 { margin: 8px 0 0; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.curl { display: flex; gap: 8px; align-items: flex-start; }
+.curl pre { flex: 1; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; }
+@media (prefers-reduced-motion: reduce) { #busy::before { animation: none; } }
+</style>
+</head>
+<body class="tab-a">
+
+<header class="top">
+  <div class="brand">
+    <div class="logo">OL</div>
+    <div><h1>Ownership Ledger</h1><p>Test console · settlement feed → who owns what</p></div>
+  </div>
+  <div class="status">
+    <span id="busy"></span>
+    <span class="pill" id="st-a"><i></i>API :3000</span>
+    <span class="pill" id="st-b"><i></i>Test viewer :3001</span>
+    <button class="btn danger" id="reset" type="button">Reset databases</button>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab" role="tab" data-tab="a" aria-selected="true" type="button"><b>A</b><strong>Live API</strong><span>localhost:3000 · events you send now</span></button>
+  <button class="tab" role="tab" data-tab="b" aria-selected="false" type="button"><b>B</b><strong>Test results</strong><span>localhost:3001 · what npm test left in ledger_test</span></button>
+</nav>
+
+<div class="legend">
+  <span><i class="sw fin"></i>finalized (at or below finalizedThrough)</span>
+  <span><i class="sw prov"></i>provisional (could still be retracted)</span>
+  <span><b class="m POST">POST</b> ingest</span>
+  <span><b class="m GET">GET</b> read</span>
+  <span><b class="badge ok">accepted · applied</b></span>
+  <span><b class="badge neutral">duplicate</b></span>
+  <span><b class="badge warn">replaced · waiting</b></span>
+  <span><b class="badge bad">conflict · rejected · error</b></span>
+</div>
+
+<main class="layout">
+  <!-- Controls -->
+  <div class="col">
+    <!-- A controls -->
+    <div id="ctl-a" class="col">
+      <section class="card">
+        <header><h2>Scenario</h2><button class="btn" id="a-new" type="button">New scenario</button></header>
+        <div class="body">
+          <p class="hint">Heights are relative to <b>h</b>, the highest height the ledger has seen when the scenario starts, so the steps work on any database.</p>
+          <dl class="scen">
+            <dt>h</dt><dd id="a-base">set on first step</dd>
+            <dt>event ids</dt><dd id="a-prefix">–</dd>
+            <dt>asset</dt><dd>FUND-A</dd>
+          </dl>
+          <div id="a-warn" class="alert-box warn"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><h2>1 · Ingest <small>POST /events</small></h2>
+          <label class="inline"><input type="checkbox" id="a-auto" checked> refresh reads</label></header>
+        <div class="body">
+          <ol class="steps" id="a-steps"></ol>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><h2>2 · Read <small>GET</small></h2></header>
+        <div class="body">
+          <button class="btn readbtn" type="button" data-read="a-holders"><b class="m GET">GET</b>/assets/FUND-A/holders</button>
+          <div class="row">
+            <button class="btn readbtn" style="flex:1" type="button" data-read="a-positions"><b class="m GET">GET</b>/investors/<span id="a-inv-label">alice</span>/positions</button>
+            <select id="a-inv" aria-label="Investor"><option>alice</option><option>bob</option><option>carol</option><option>dave</option></select>
+          </div>
+          <button class="btn readbtn" type="button" data-read="a-metrics"><b class="m GET">GET</b>/metrics</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- B controls -->
+    <div id="ctl-b" class="col" hidden>
+      <section class="card">
+        <header><h2>1 · Run the test</h2></header>
+        <div class="body">
+          <p class="hint">Runs the concurrency scenario with every protection on: 8 workers, two instances, a RETRACT in the middle. The result is compared with the oracle.</p>
+          <div class="row">
+            <label class="inline" for="b-seed">seed</label><input id="b-seed" type="number" min="0" value="1">
+            <button class="btn primary" id="b-test" type="button">Run passing scenario</button>
+          </div>
+          <code class="hint">SEEDS=n npx vitest run -t "all protections"</code>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><h2>Must-fail proof</h2></header>
+        <div class="body">
+          <p class="hint">Switches one protection off and reruns the scenario. It must break. The broken data stays in ledger_test, so the reads show it.</p>
+          <div class="row">
+            <select id="b-switch" aria-label="Protection">
+              <option>frontierLock</option><option>uniqueEventId</option><option>tombstones</option>
+              <option>ingestBarrier</option><option>negativeCheck</option><option>finalityGuard</option>
+            </select>
+            <button class="btn danger" id="b-proof" type="button">Run with it off</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><h2>2 · Test viewer <small>API on :3001 → ledger_test</small></h2></header>
+        <div class="body">
+          <p class="hint">Runs start it automatically. Use these if you need it on its own.</p>
+          <div class="row">
+            <button class="btn" id="b-start" type="button">Start</button>
+            <button class="btn" id="b-stop" type="button">Stop</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><h2>3 · Read <small>GET</small></h2></header>
+        <div class="body">
+          <div class="row">
+            <button class="btn readbtn" style="flex:1" type="button" data-read="b-holders"><b class="m GET">GET</b>/assets/<span id="b-asset-label">A1</span>/holders</button>
+            <select id="b-asset" aria-label="Asset"><option>A1</option><option>A2</option><option>A3</option></select>
+          </div>
+          <div class="row">
+            <button class="btn readbtn" style="flex:1" type="button" data-read="b-positions"><b class="m GET">GET</b>/investors/<span id="b-inv-label">I1</span>/positions</button>
+            <select id="b-inv" aria-label="Investor"><option>I1</option><option>I2</option><option>I3</option><option>I4</option><option>I5</option><option>I6</option></select>
+          </div>
+          <button class="btn readbtn" type="button" data-read="b-metrics"><b class="m GET">GET</b>/metrics</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Views and log -->
+  <div class="col">
+    <section class="card" id="term-card" hidden>
+      <header><h2 id="term-title">Command</h2><span class="when" id="term-meta"></span></header>
+      <div class="banner" id="term-banner"></div>
+      <div class="term" id="term"></div>
+    </section>
+
+    <div id="view-a" class="views">
+      <section class="card"><header><h2>Holders <small>FUND-A</small></h2><span class="when" id="a-holders-when"></span></header><div class="body" id="a-holders"><div class="empty">Send a step or click GET holders.</div></div></section>
+      <section class="card"><header><h2>Positions <small id="a-positions-title">alice</small></h2><span class="when" id="a-positions-when"></span></header><div class="body" id="a-positions"><div class="empty">Send a step or click GET positions.</div></div></section>
+      <section class="card wide"><header><h2>Metrics <small>this instance</small></h2><span class="when" id="a-metrics-when"></span></header><div class="body" id="a-metrics"><div class="empty">Click GET /metrics.</div></div></section>
+    </div>
+
+    <div id="view-b" class="views" hidden>
+      <section class="card"><header><h2>Holders <small id="b-holders-title">A1</small></h2><span class="when" id="b-holders-when"></span></header><div class="body" id="b-holders"><div class="empty">Run the passing scenario, then read.</div></div></section>
+      <section class="card"><header><h2>Positions <small id="b-positions-title">I1</small></h2><span class="when" id="b-positions-when"></span></header><div class="body" id="b-positions"><div class="empty">Run the passing scenario, then read.</div></div></section>
+      <section class="card wide"><header><h2>Metrics <small>test viewer instance</small></h2><span class="when" id="b-metrics-when"></span></header><div class="body" id="b-metrics"><div class="empty">Counters belong to the viewer instance, so they start at zero. frontier, finalizedThrough and highestSeen come from ledger_test.</div></div></section>
+    </div>
+
+    <section class="card">
+      <header><h2>Request log <small>newest first · each entry has the equivalent curl</small></h2><button class="btn" id="log-clear" type="button">Clear</button></header>
+      <div class="log-list" id="log"><div class="empty">No requests yet.</div></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const HOST = { a: 'localhost:3000', b: 'localhost:3001' };
+const OUTCOME = { accepted: 'ok', applied: 'ok', duplicate: 'neutral', replaced: 'warn', conflict: 'bad', rejected: 'bad' };
+const state = { tab: 'a', base: null, prefix: null, finalRetracts: 0, busy: false };
+
+// ---- Option A steps. h = scenario base, p = id prefix. -------------------------------------------------
+const tx = (eventId, height, from, to, units) => ({ eventId, height, assetId: 'FUND-A', from, to, units });
+const STEPS = [
+  { id: 'issue', title: 'Issue 1000 units to alice', note: 'Height h+1. Applies straight away.', tag: 'ordering', expect: 'accepted',
+    build: (h, p) => tx(`${p}-1`, h + 1, null, 'alice', 1000) },
+  { id: 'early', title: 'h+3 arrives early: alice → bob 250', note: 'h+2 is missing, so it waits. gapAt shows h+2.', tag: 'ordering', expect: 'accepted',
+    build: (h, p) => tx(`${p}-3`, h + 3, 'alice', 'bob', 250) },
+  { id: 'fill', title: 'Fill the gap: alice → carol 100', note: 'h+2 arrives. h+2 then h+3 apply, in order.', tag: 'frontierLock', expect: 'accepted',
+    build: (h, p) => tx(`${p}-2`, h + 2, 'alice', 'carol', 100) },
+  { id: 'dup', title: 'Redeliver the same message', note: 'Same id, same content. Nothing changes.', tag: 'uniqueEventId', expect: 'duplicate',
+    build: (h, p) => tx(`${p}-2`, h + 2, 'alice', 'carol', 100) },
+  { id: 'conflict', title: 'Same id, different content', note: 'The stored row is kept and an alert is raised.', tag: 'uniqueEventId', expect: 'conflict',
+    build: (h, p) => tx(`${p}-2`, h + 2, 'alice', 'carol', 999) },
+  { id: 'overspend', title: 'Overspend: bob → dave 5000', note: 'bob holds 250. The drain stops at h+4 and alerts.', tag: 'negativeCheck', expect: 'accepted',
+    build: (h, p) => tx(`${p}-4`, h + 4, 'bob', 'dave', 5000) },
+  { id: 'retract', title: 'RETRACT from h+4', note: 'Tombstones the overspend and unblocks the ledger.', tag: 'retraction', expect: 'applied',
+    build: (h, p) => ({ eventId: `${p}-r4`, type: 'RETRACT', fromHeight: h + 4 }) },
+  { id: 'resend', title: 'Redeliver the retracted overspend', note: 'The tombstone holds. It does not come back.', tag: 'tombstones', expect: 'duplicate',
+    build: (h, p) => tx(`${p}-4`, h + 4, 'bob', 'dave', 5000) },
+  { id: 'advance', title: 'Advance 13 heights', note: '13 × alice → bob 1. finalizedThrough passes h+3, so alice gets a finalized figure.', tag: 'finality', expect: 'accepted' },
+  { id: 'final', title: 'RETRACT into final heights', note: 'fromHeight = finalizedThrough. Rejected with an alert.', tag: 'finalityGuard', expect: 'rejected' },
+];
+
+function renderSteps() {
+  $('#a-steps').innerHTML = STEPS.map((s, i) => `
+    <li><button class="step" type="button" data-step="${s.id}">
+      <span class="num">${i + 1}</span>
+      <span><b>${esc(s.title)}</b><small>${esc(s.note)}</small><span class="tag">${esc(s.tag)}</span></span>
+      <span class="res"><span class="exp">expect ${esc(s.expect)}</span><span class="got"></span></span>
+    </button></li>`).join('');
+}
+
+// ---- HTTP through the local console server ------------------------------------------------------------
+async function call(target, method, path, body, label, { quiet = false } = {}) {
+  const t0 = performance.now();
+  const entry = { target, method, path, body, label, status: 0, data: null, text: '', time: new Date() };
+  try {
+    const r = await fetch(`/${target}${path}`, {
+      method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined,
+    });
+    entry.status = r.status;
+    entry.text = await r.text();
+    try { entry.data = JSON.parse(entry.text); } catch { /* not JSON */ }
+  } catch (err) {
+    entry.text = String(err);
+  }
+  entry.ms = Math.round(performance.now() - t0);
+  entry.unreachable = entry.status === 502 || entry.status === 0;
+  if (!quiet) addLog(entry);
+  return entry;
+}
+
+function curlOf(e) {
+  const url = `${HOST[e.target]}${e.path}`;
+  return e.method === 'GET' ? `curl ${url}`
+    : `curl -XPOST ${url} -H 'content-type: application/json' \\\n  -d '${JSON.stringify(e.body)}'`;
+}
+
+function statusBadge(e) {
+  if (e.unreachable) return `<span class="badge bad">unreachable</span>`;
+  const cls = e.status < 300 ? 'ok' : e.status < 500 ? 'bad' : 'bad';
+  const text = { 200: '200 OK', 202: '202 Accepted', 400: '400 Bad Request', 404: '404 Not Found' }[e.status] ?? e.status;
+  return `<span class="badge ${cls}">${text}</span>`;
+}
+
+function outcomeBadge(o) {
+  return o ? `<span class="badge ${OUTCOME[o] ?? 'neutral'}">${esc(o)}</span>` : '';
+}
+
+function addLog(e) {
+  const list = $('#log');
+  if (list.querySelector('.empty')) list.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = 'entry';
+  const response = e.data ? JSON.stringify(e.data, null, 2) : e.text;
+  el.innerHTML = `
+    <div class="line1">
+      <span class="target ${e.target}">${e.target.toUpperCase()}</span>
+      <b class="m ${e.method}">${e.method}</b>
+      <span class="url">${esc(HOST[e.target] + e.path)}</span>
+      ${statusBadge(e)} ${outcomeBadge(e.data?.outcome)}
+      <span class="meta">${e.ms} ms · ${e.time.toLocaleTimeString()}</span>
+    </div>
+    ${e.label ? `<div class="label">${esc(e.label)}</div>` : ''}
+    <details><summary>Request, response and curl</summary>
+      <div class="cols">
+        <div><h4>Request body</h4><pre>${esc(e.body ? JSON.stringify(e.body, null, 2) : '(none)')}</pre></div>
+        <div><h4>Response</h4><pre>${esc(e.unreachable ? unreachableText(e.target) : response)}</pre></div>
+      </div>
+      <h4>curl</h4>
+      <div class="curl"><pre>${esc(curlOf(e))}</pre><button class="btn" type="button">Copy</button></div>
+    </details>`;
+  el.querySelector('.curl button').addEventListener('click', (ev) => copy(curlOf(e), ev.currentTarget));
+  list.prepend(el);
+  while (list.children.length > 60) list.lastElementChild.remove();
+}
+
+function copy(text, btn) {
+  navigator.clipboard.writeText(text).then(() => { btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1400); },
+    () => { btn.textContent = 'Copy failed'; });
+}
+
+const unreachableText = (t) => t === 'a'
+  ? 'The API on :3000 is not reachable. Start it with: docker compose up -d --build'
+  : 'The test viewer on :3001 is not running. Run the passing scenario or click Start.';
+
+// ---- Renderers ----------------------------------------------------------------------------------------
+const n = (v) => Number(v);
+const fmt = (v) => Number(v).toLocaleString('en-US');
+
+function chip(label, value, cls = '') {
+  return `<div class="chip ${cls}"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`;
+}
+
+function headerChips(d) {
+  return `<div class="chips">
+    ${chip('appliedThrough', d.appliedThrough)}
+    ${chip('finalizedThrough', d.finalizedThrough)}
+    ${chip('gapAt', d.gapAt ?? 'none', d.gapAt ? 'bad' : 'ok')}
+    ${chip('waitingCount', d.waitingCount, d.waitingCount > 0 ? 'warn' : '')}
+    ${d.issuedSupply !== undefined ? chip('issuedSupply', fmt(d.issuedSupply)) : ''}
+  </div>`;
+}
+
+function bar(fin, total, scale) {
+  const solid = Math.max(0, Math.min(fin, total));
+  const hatched = Math.max(0, total - solid);
+  const pct = (x) => (scale > 0 ? (100 * x) / scale : 0).toFixed(2);
+  return `<div class="bar" title="finalized ${fin}, total ${total}"><i class="fin" style="width:${pct(solid)}%"></i><i class="prov" style="width:${pct(hatched)}%"></i></div>`;
+}
+
+function rowsTable(rows, keyLabel, scale) {
+  return `<div class="tbl"><table>
+    <thead><tr><th>${keyLabel}</th><th class="n">finalized</th><th class="n">provisional</th><th class="n">total</th><th style="width:28%"></th></tr></thead>
+    <tbody>${rows.map((r) => `<tr>
+      <td class="mono">${esc(r.key)}</td>
+      <td class="n fin">${fmt(r.fin)}</td>
+      <td class="n ${r.prov < 0 ? 'neg' : 'prov'}">${r.prov > 0 ? '+' : ''}${fmt(r.prov)}</td>
+      <td class="n">${fmt(r.fin + r.prov)}</td>
+      <td>${bar(r.fin, r.fin + r.prov, scale)}</td></tr>`).join('')}</tbody>
+  </table></div>`;
+}
+
+function errorView(e) {
+  if (e.unreachable) return `<div class="alert-box bad">${esc(unreachableText(e.target))}</div>`;
+  return `<div class="alert-box bad">HTTP ${e.status}: ${esc(e.text)}</div>`;
+}
+
+const raw = (d) => `<details class="raw"><summary>Raw JSON</summary><pre>${esc(JSON.stringify(d, null, 2))}</pre></details>`;
+const stamp = (id) => { $(id).textContent = `updated ${new Date().toLocaleTimeString()}`; };
+
+function renderHolders(el, e) {
+  if (e.status !== 200) { el.innerHTML = errorView(e); return; }
+  const d = e.data;
+  const rows = d.holders.map((h) => ({ key: h.investorId, fin: n(h.finalized), prov: n(h.provisional) }));
+  const supply = n(d.issuedSupply);
+  const sum = rows.reduce((s, r) => s + r.fin + r.prov, 0);
+  const sumFin = rows.reduce((s, r) => s + r.fin, 0);
+  const sumProv = rows.reduce((s, r) => s + r.prov, 0);
+  const scale = Math.max(supply, ...rows.map((r) => r.fin + r.prov), 1);
+  el.innerHTML = headerChips(d) + (rows.length === 0 ? `<div class="empty">No holders for ${esc(d.assetId)} yet.</div>` : `
+    ${rowsTable(rows, 'investor', scale)}
+    <div class="check ${sum === supply ? 'ok' : 'bad'}">${sum === supply ? '✓' : '✗'} Σ holdings ${fmt(sum)} ${sum === supply ? '=' : '≠'} issued supply ${fmt(supply)}
+      <span style="opacity:.75">· Σ finalized ${fmt(sumFin)} + Σ provisional ${fmt(sumProv)}</span></div>`) + raw(d);
+}
+
+function renderPositions(el, e) {
+  if (e.status !== 200) { el.innerHTML = errorView(e); return; }
+  const d = e.data;
+  const rows = d.positions.map((p) => ({ key: p.assetId, fin: n(p.finalized), prov: n(p.provisional) }));
+  const scale = Math.max(...rows.map((r) => Math.max(r.fin, r.fin + r.prov)), 1);
+  el.innerHTML = headerChips(d) + (rows.length === 0 ? `<div class="empty">${esc(d.investorId)} holds nothing.</div>` : rowsTable(rows, 'asset', scale)) + raw(d);
+}
+
+function countChips(obj, classOf) {
+  const keys = Object.keys(obj ?? {});
+  if (keys.length === 0) return '<span class="badge neutral">none</span>';
+  return keys.map((k) => `<span class="badge ${classOf(k)}">${esc(k)} ${obj[k]}</span>`).join(' ');
+}
+
+function renderMetrics(el, e) {
+  if (e.status !== 200) { el.innerHTML = errorView(e); return; }
+  const d = e.data;
+  const lag = n(d.highestSeen) - n(d.frontier);
+  el.innerHTML = `
+    <div class="tiles">
+      <div class="tile"><span>frontier</span><strong>${esc(d.frontier)}</strong></div>
+      <div class="tile"><span>finalizedThrough</span><strong>${esc(d.finalizedThrough)}</strong></div>
+      <div class="tile"><span>highestSeen</span><strong>${esc(d.highestSeen)}</strong></div>
+      <div class="tile ${lag >= 10 ? 'bad' : lag >= 4 ? 'warn' : ''}"><span>lag</span><strong>${lag}</strong></div>
+      <div class="tile ${d.oldestWaitingAgeSeconds !== null ? 'warn' : ''}"><span>oldest waiting</span><strong>${d.oldestWaitingAgeSeconds === null ? '–' : Math.round(d.oldestWaitingAgeSeconds) + 's'}</strong></div>
+    </div>
+    <div class="group"><span>acks by outcome</span><div>${countChips(d.ingests, (k) => OUTCOME[k] ?? 'neutral')}</div></div>
+    <div class="group"><span>alerts</span><div>${countChips(d.alerts, () => 'bad')}</div></div>
+    <div class="group"><span>work</span><div class="mono">drains ${fmt(d.drains)} · events applied ${d.eventsApplied} · retractions ${d.retractionsApplied} applied / ${d.retractionsRejected} rejected</div></div>
+    <p class="hint">Counters are per instance and start at zero when it restarts. lag = highestSeen − frontier (alerts at 4 and 10).</p>
+    ${raw(d)}`;
+}
+
+// ---- Reads ---------------------------------------------------------------------------------------------
+const READS = {
+  'a-holders': () => ({ t: 'a', path: '/assets/FUND-A/holders', render: renderHolders }),
+  'a-positions': () => ({ t: 'a', path: `/investors/${encodeURIComponent($('#a-inv').value)}/positions`, render: renderPositions }),
+  'a-metrics': () => ({ t: 'a', path: '/metrics', render: renderMetrics }),
+  'b-holders': () => ({ t: 'b', path: `/assets/${encodeURIComponent($('#b-asset').value)}/holders`, render: renderHolders }),
+  'b-positions': () => ({ t: 'b', path: `/investors/${encodeURIComponent($('#b-inv').value)}/positions`, render: renderPositions }),
+  'b-metrics': () => ({ t: 'b', path: '/metrics', render: renderMetrics }),
+};
+
+async function read(id, quiet = false) {
+  const r = READS[id]();
+  const e = await call(r.t, 'GET', r.path, null, quiet ? null : 'Read', { quiet });
+  r.render($('#' + id), e);
+  stamp(`#${id}-when`);
+  return e;
+}
+
+const readAll = (tab, quiet) => Promise.all(['holders', 'positions', 'metrics'].map((k) => read(`${tab}-${k}`, quiet)));
+
+// ---- Option A scenario ---------------------------------------------------------------------------------
+async function newScenario() {
+  const e = await call('a', 'GET', '/metrics', null, 'Read metrics to choose the scenario base h');
+  renderMetrics($('#a-metrics'), e);
+  stamp('#a-metrics-when');
+  if (e.status !== 200) return false;
+  const m = e.data;
+  const frontier = n(m.frontier);
+  const seen = n(m.highestSeen);
+  state.base = Math.max(frontier, seen);
+  state.prefix = `s${state.base}${String.fromCharCode(97 + Math.floor(Math.random() * 26))}`;
+  state.finalRetracts = 0;
+  $('#a-base').textContent = String(state.base);
+  $('#a-prefix').textContent = `${state.prefix}-*`;
+  $('#a-warn').textContent = seen > frontier
+    ? `The ledger is waiting at height ${frontier + 1} (events up to ${seen} are queued). New events will queue behind it. Use Reset databases for a clean start.`
+    : '';
+  document.querySelectorAll('.step').forEach((b) => { b.classList.remove('done', 'miss'); b.querySelector('.got').innerHTML = ''; });
+  return true;
+}
+
+async function runStep(def, btn) {
+  await withBusy(def.title, async () => {
+    if (state.base === null && !(await newScenario())) return;
+    const h = state.base;
+    const p = state.prefix;
+    const results = [];
+    if (def.id === 'advance' || def.id === 'final') {
+      const m = await call('a', 'GET', '/metrics', null, null, { quiet: true });
+      if (m.status !== 200) { addLog(m); return; }
+      if (def.id === 'advance') {
+        const start = Math.max(n(m.data.frontier), n(m.data.highestSeen)) + 1;
+        for (let k = 0; k < 13; k++) {
+          results.push(await call('a', 'POST', '/events', tx(`${p}-a${start + k}`, start + k, 'alice', 'bob', 1), `${def.title} (${k + 1}/13)`));
+        }
+      } else {
+        state.finalRetracts += 1;
+        const body = { eventId: `${p}-rf${state.finalRetracts}`, type: 'RETRACT', fromHeight: n(m.data.finalizedThrough) };
+        results.push(await call('a', 'POST', '/events', body, `${def.title} (finalizedThrough is ${m.data.finalizedThrough})`));
+      }
+    } else {
+      results.push(await call('a', 'POST', '/events', def.build(h, p), def.title));
+    }
+    const outcomes = results.map((r) => r.data?.outcome ?? (r.unreachable ? 'unreachable' : `HTTP ${r.status}`));
+    const all = [...new Set(outcomes)];
+    const got = all.length === 1 ? all[0] : all.join(' / ');
+    const match = all.length === 1 && all[0] === def.expect;
+    btn.classList.toggle('done', match);
+    btn.classList.toggle('miss', !match);
+    btn.querySelector('.got').innerHTML = `${outcomeBadge(got)}${results.length > 1 ? `<span class="exp">× ${results.length}</span>` : ''}`;
+    if ($('#a-auto').checked) {
+      await sleep(450); // the drain runs right after the ack; give it a moment before reading
+      await readAll('a', true);
+    }
+  });
+}
+
+// ---- Option B commands ---------------------------------------------------------------------------------
+function colorLine(line) {
+  const t = esc(line);
+  if (/^\s*$/.test(line)) return t;
+  if (/^stdout \||^ RUN |^\s*(Start at|Duration|Test Files)/.test(line)) return `<span class="dim">${t}</span>`;
+  if (/FAIL|failed|problem|Error|✗|×|expected .* got|negative/.test(line)) return `<span class="r">${t}</span>`;
+  if (/\bok\b|✓|passed|match the oracle|is up|Healthy|Started/.test(line)) return `<span class="g">${t}</span>`;
+  if (/^\s*node-\d|^\s*frontier \d|alerts \{/.test(line)) return `<span class="c">${t}</span>`;
+  if (/skipped|Stopp|Remov/.test(line)) return `<span class="y">${t}</span>`;
+  return t;
+}
+
+function showTerm(title, res) {
+  $('#term-card').hidden = false;
+  $('#term-title').textContent = title;
+  $('#term-meta').textContent = `exit ${res.code} · ${(res.ms / 1000).toFixed(1)} s · ${new Date().toLocaleTimeString()}`;
+  const banner = $('#term-banner');
+  banner.className = `banner ${res.ok ? 'ok' : 'bad'}`;
+  banner.textContent = res.banner ?? (res.ok ? 'Done.' : 'Failed.');
+  $('#term').innerHTML = (res.output ?? '').trim().split('\n').map(colorLine).join('\n');
+}
+
+async function runCommand(name, payload, title, after) {
+  await withBusy(title, async () => {
+    let res;
+    try {
+      const r = await fetch(`/run/${name}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
+      res = await r.json();
+      if (res.error) res = { ok: false, code: -1, ms: 0, output: res.error, banner: res.error };
+    } catch (err) {
+      res = { ok: false, code: -1, ms: 0, output: String(err), banner: 'The console server is not reachable. Is node server.mjs running?' };
+    }
+    showTerm(title, res);
+    await pollStatus();
+    if (after) await after(res);
+  });
+}
+
+// ---- Busy state, status, tabs --------------------------------------------------------------------------
+async function withBusy(label, fn) {
+  if (state.busy) return;
+  state.busy = true;
+  $('#busy').textContent = label;
+  document.querySelectorAll('.btn, .step').forEach((b) => { b.disabled = true; });
+  try { await fn(); } finally {
+    state.busy = false;
+    $('#busy').textContent = '';
+    document.querySelectorAll('.btn, .step').forEach((b) => { b.disabled = false; });
+  }
+}
+
+async function pollStatus() {
+  await Promise.all(['a', 'b'].map(async (t) => {
+    let up = false;
+    try { up = (await fetch(`/${t}/health`)).ok; } catch { /* down */ }
+    const pill = $(`#st-${t}`);
+    pill.classList.toggle('up', up);
+    pill.classList.toggle('down', !up);
+  }));
+}
+
+function setTab(t) {
+  state.tab = t;
+  document.body.className = `tab-${t}`;
+  document.querySelectorAll('.tab').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === t)));
+  for (const x of ['a', 'b']) { $(`#ctl-${x}`).hidden = x !== t; $(`#view-${x}`).hidden = x !== t; }
+  try { localStorage.setItem('ledger-demo-tab', t); } catch { /* storage unavailable */ }
+}
+
+// ---- Wiring --------------------------------------------------------------------------------------------
+renderSteps();
+document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => setTab(b.dataset.tab)));
+document.querySelectorAll('.step').forEach((b) => b.addEventListener('click', () => runStep(STEPS.find((s) => s.id === b.dataset.step), b)));
+document.querySelectorAll('[data-read]').forEach((b) => b.addEventListener('click', () => withBusy('Reading', () => read(b.dataset.read))));
+$('#a-new').addEventListener('click', () => withBusy('New scenario', newScenario));
+$('#a-inv').addEventListener('change', (e) => { $('#a-inv-label').textContent = e.target.value; $('#a-positions-title').textContent = e.target.value; });
+$('#b-asset').addEventListener('change', (e) => { $('#b-asset-label').textContent = e.target.value; $('#b-holders-title').textContent = e.target.value; });
+$('#b-inv').addEventListener('change', (e) => { $('#b-inv-label').textContent = e.target.value; $('#b-positions-title').textContent = e.target.value; });
+$('#b-test').addEventListener('click', () => {
+  const seed = $('#b-seed').value || '1';
+  runCommand('test', { seed }, `SEEDS=${seed} npx vitest run -t "all protections"`, async (res) => { if (res.ok) await readAll('b', false); });
+});
+$('#b-proof').addEventListener('click', () => {
+  const name = $('#b-switch').value;
+  runCommand('proof', { name }, `npx vitest run -t "${name} is switched off"`, async () => { await readAll('b', false); });
+});
+$('#b-start').addEventListener('click', () => runCommand('viewer-start', {}, 'Start test viewer on :3001'));
+$('#b-stop').addEventListener('click', () => runCommand('viewer-stop', {}, 'Stop test viewer'));
+$('#reset').addEventListener('click', () => {
+  if (!confirm('Wipe both databases (ledger and ledger_test) and restart the stack? This takes about 30 seconds.')) return;
+  runCommand('reset', {}, 'docker compose down -v && docker compose up -d --build --wait', async (res) => {
+    if (!res.ok) return;
+    state.base = null;
+    $('#a-base').textContent = 'set on first step';
+    $('#a-prefix').textContent = '–';
+    $('#a-warn').textContent = '';
+    document.querySelectorAll('.step').forEach((b) => { b.classList.remove('done', 'miss'); b.querySelector('.got').innerHTML = ''; });
+    await readAll('a', true);
+  });
+});
+$('#log-clear').addEventListener('click', () => { $('#log').innerHTML = '<div class="empty">No requests yet.</div>'; });
+
+let saved = 'a';
+try { saved = localStorage.getItem('ledger-demo-tab') ?? 'a'; } catch { /* storage unavailable */ }
+setTab(saved === 'b' ? 'b' : 'a');
+pollStatus();
+setInterval(pollStatus, 3000);
+</script>
+</body>
+</html>

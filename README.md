@@ -45,19 +45,26 @@ GET /investors/alice/positions
 
 `GET /metrics` returns JSON counters: acks by outcome, alerts by type, drains, events applied, retractions applied and rejected, `frontier`, `finalizedThrough`, `highestSeen`, and `oldestWaitingAgeSeconds`. `GET /health` returns `{"ok":true}`.
 
-To replay the gap demo from the plan, start the API with `GENESIS_FRONTIER=4470 docker compose up -d --build`. Then post 4471, then 4473 (`gapAt` is 4472), then 4472.
+To replay the gap demo from the plan, start from an empty database, because the starting frontier is set only when the database is first created:
+
+```
+docker compose down -v
+GENESIS_FRONTIER=4470 docker compose up -d --build
+```
+
+Then post 4471, then 4473 (`gapAt` is 4472), then 4472.
 
 ## Design
 
 - **The event log is the source of truth.** `events` is append-only and never deleted from. Each event's status is `waiting`, `applied`, `retracted` or `rejected`. `holdings` is derived from it and has a `CHECK (units >= 0)` constraint.
-- **Events apply strictly in height order**, one event per transaction, each at `frontier + 1`, under the frontier lock (`SELECT ... FOR UPDATE` on the single `ledger_state` row). A gap, an overspend or two events at one height stops the drain and raises an alert. Nothing is ever skipped automatically.
+- **Events apply strictly in height order**, one event per transaction, each at `frontier + 1`, under the frontier lock (`SELECT ... FOR UPDATE` on the single `ledger_state` row). An overspend or two events at one height stops the drain and raises an alert at once. A gap stops it too: it shows as `gapAt` in the reads and raises the lag and stall alerts. Nothing is ever skipped automatically.
 - **The database decides duplicates.** Ingest is `INSERT ... ON CONFLICT (event_id) DO NOTHING`. When a message arrives with an id already stored:
 
   | Stored row | Same content | Different content |
   |---|---|---|
   | `retracted` (a tombstone) | ignored | replaced as a new `waiting` event |
   | `waiting` or `applied` | ignored | left unchanged, `live_row_conflict` alert |
-- **Retraction** takes the exclusive advisory lock, then the frontier lock. It undoes applied events newest-first, so no holder goes negative even briefly, and tombstones every event it sweeps. It then rewinds the frontier to `fromHeight - 1`. A retraction that reaches final heights (`fromHeight <= finalized_through`) is rejected with an alert.
+- **Retraction** takes the exclusive advisory lock, then the frontier lock. It undoes applied events newest-first, so no holder goes negative even briefly, and tombstones every event it sweeps. It then rewinds the frontier to `fromHeight - 1`, or leaves it where it is if it is already lower. A retraction that reaches final heights (`fromHeight <= finalized_through`) is rejected with an alert.
 - **The ingest barrier.** Transfer ingest holds the same advisory lock in shared mode. A retraction therefore waits for every ingest already in flight, and its sweep sees it. Ingests that start later wait until the rewind has committed.
 - **Lock order is always the advisory lock first, then the `ledger_state` row.** The drain takes only the row lock, so the two can never wait on each other in a cycle.
 - **Finality never goes backwards.** `ledger_state.finalized_through` is the highest `frontier - 12` the ledger has ever reached; every frontier write raises it with `GREATEST`, nothing lowers it. An applied event is finalized when `height <= finalized_through`. The line is stored, not computed from the current frontier, because a retraction rewinds the frontier: a line computed from it would drop too. A client would then see a `finalized` figure go down, and a second RETRACT could reach heights already reported final. The retraction guard and the reads use the same stored line. The guard keeps `frontier >= finalized_through`, so every height up to the line is applied.
@@ -160,7 +167,7 @@ The final state must also satisfy:
 Each switch is one `if` at the exact spot it guards, marked `test-only switch`, and all default to on. The only other test hook is `hooks.beforeCommit`, a yield the test uses to add jitter and to hold an ingest open.
 
 **Reading the output.**
-- Each passing seed prints a summary, per instance, of what happened:
+- Each passing seed prints a summary, per instance, of what happened. The counts vary from run to run with timing; `ok` is what matters:
   ```
   seed 1: ok, frontier 34, finalized through 23
       node-1: acks {"accepted":24,"duplicate":49,"applied":1}, applied 17, retractions 1 applied / 0 rejected, alerts {"negative_balance_block":1}
@@ -191,6 +198,12 @@ Each switch is one `if` at the exact spot it guards, marked `test-only switch`, 
   ```
 - Every switch currently fails in round 1. In a 10-seed sample per switch, every switch failed every seed. The passing scenario has been run clean over 40 seeds.
 
+**Test console (optional).** A browser page for testing by hand and for seeing what the tests check. It is not part of the service and is not needed to run `npm test`. With the stack up, run `npm run demo` and open http://localhost:4000.
+- **A · Live API** sends prepared events to `:3000` in ten steps: an issuance, a gap and its fill, a duplicate, a same-id conflict, an overspend, a retraction, a resent tombstone, finality moving forward, and a retraction into final heights. Each step shows the outcome it expects and the one it got. Holders, positions and metrics refresh after every step.
+- **B · Test results** runs the passing scenario for a chosen seed, or a must-fail proof with one protection off. It then reads what the run left in `ledger_test` through a second API container on `:3001`. After a full `npm test`, `ledger_test` holds the last must-fail run, which is broken on purpose; run the passing scenario first.
+- Every request is logged with its body, its response and the equivalent `curl`. **Reset databases** runs `docker compose down -v` and starts the stack again.
+- `demo/server.mjs` serves the page and forwards its requests to `:3000` and `:3001`, so the service needs no CORS settings. It runs only a fixed list of commands (`npx vitest`, `docker compose`), listens on 127.0.0.1 only, and has no dependencies.
+
 ## Open decisions
 
 - **Message format.** Exactly the feed's two shapes. A transfer has no `type` field: `{eventId, height, assetId, from, to, units}`. A retraction is `{eventId, type: "RETRACT", fromHeight}`. Any other `type` is rejected with 400.
@@ -209,4 +222,9 @@ Each switch is one `if` at the exact spot it guards, marked `test-only switch`, 
 - No scheduled reconciliation.
 - No snapshot fold of old events, and no per-asset frontiers.
 - No epoch or chain-reorganisation handling beyond RETRACT.
-- No auth, no UI, no metrics backend.
+- No auth, no UI, no metrics backend. (`demo/` is a testing aid, described under "The test".)
+
+## More detail
+
+- [doc/FLOW.md](doc/FLOW.md): how a test round flows, from delivery through the two instances to the endpoints.
+- [doc/PROTECTIONS.md](doc/PROTECTIONS.md): a walkthrough of the six protections and what breaks without each one.

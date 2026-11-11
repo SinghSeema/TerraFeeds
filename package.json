@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "demo": "node demo/server.mjs"
   },
   "dependencies": {
     "fastify": "^4.28.1",
