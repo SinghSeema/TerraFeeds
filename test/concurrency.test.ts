@@ -6,7 +6,24 @@ import { createPool, migrate } from '../src/db.js';
 import { ALL_PROTECTIONS, Ledger, type Hooks, type Protections } from '../src/ledger.js';
 import { buildApp } from '../src/server.js';
 
-const print = console.log.bind(console); // the service's own log lines are muted below; test evidence is not
+const print = console.log.bind(console); // the service's own log lines go through show() below; test evidence does not
+
+// LOG=1 prints every service log line, one per line, as `time instance message key=value ...`, plus the
+// scenario's own phase notes. Off by default: a full run writes thousands of lines.
+// Written straight to stdout so vitest does not insert a header between batches of lines.
+const LOG = process.env.LOG === '1';
+const out = (text: string) => process.stdout.write(`${text}\n`);
+const note = (text: string) => { if (LOG) out(`\n---- ${text}`); };
+function show(line: unknown) {
+  if (!LOG) return;
+  try {
+    const { time, level, instance, msg, ...rest } = JSON.parse(String(line));
+    const fields = Object.entries(rest).map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`);
+    out(`${String(time).slice(11, 23)} ${String(instance).padEnd(6)} ${level === 'alert' ? 'ALERT ' : ''}${msg} ${fields.join(' ')}`);
+  } catch {
+    out(String(line));
+  }
+}
 
 // A separate database, so the API container's drain timer never touches test data.
 const ADMIN_URL = process.env.TEST_DATABASE_URL ?? `postgres://ledger:ledger@localhost:${process.env.PG_PORT ?? '55432'}/ledger`;
@@ -32,7 +49,7 @@ async function status(eventId: string) {
 }
 
 beforeAll(async () => {
-  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'log').mockImplementation(show);
   const admin = new pg.Client({ connectionString: ADMIN_URL });
   await admin.connect();
   const { rowCount } = await admin.query(`SELECT 1 FROM pg_database WHERE datname = 'ledger_test'`);
@@ -49,7 +66,7 @@ describe('deterministic', () => {
 
   beforeEach(async () => {
     await resetDb(4470n);
-    ledger = new Ledger(pool);
+    ledger = new Ledger(pool, {}, {}, 'single');
   });
 
   it('applies out of order arrivals in height order', async () => {
@@ -97,6 +114,23 @@ describe('deterministic', () => {
     expect(h.holders.map((x) => [x.investorId, x.finalized + x.provisional])).toEqual([['A', 93n], ['B', 7n]]);
     expect(await status('e4479')).toBe('retracted');
     expect(await ledger.reconcile()).toEqual([]);
+  });
+
+  it('keeps final heights final after a rewind lowers the frontier', async () => {
+    const msgs = [transfer(4471, null, 'A', 100)];
+    for (let h = 4472; h <= 4490; h++) msgs.push(transfer(h, 'A', 'B', 1));
+    await ingestAll(msgs);
+    const before = await ledger.holders('X'); // frontier 4490: heights <= 4478 are final
+    expect(before.finalizedThrough).toBe(4478n);
+    expect(await ledger.ingest(retract(4479))).toBe('applied'); // provisional only; frontier rewinds to 4478
+    const after = await ledger.holders('X');
+    expect([after.appliedThrough, after.finalizedThrough]).toEqual([4478n, 4478n]);
+    // What was reported final is still final: no finalized figure went down.
+    expect(after.holders.map((x) => [x.investorId, x.finalized])).toEqual(before.holders.map((x) => [x.investorId, x.finalized]));
+    // A second retraction reaching a height reported final before the rewind is still rejected.
+    expect(await ledger.ingest(retract(4470 + 5, 'r-second'))).toBe('rejected');
+    expect(await status('e4475')).toBe('applied');
+    expect(ledger.counters.alerts.retraction_rejected_final).toBe(1);
   });
 
   it('applies the same-id-different-content rules', async () => {
@@ -235,7 +269,7 @@ function makeFeed(seed: number) {
 type Feed = ReturnType<typeof makeFeed>;
 
 // Single-threaded truth: surviving events applied in height order, stopping at the first overspend.
-function oracle(f: Feed) {
+function oracle(f: Feed, finalizedThrough: bigint) {
   const holdings = new Map<string, bigint>();
   const supply = new Map<string, bigint>();
   const statuses = new Map<string, string>([[f.retraction.eventId, 'applied'], [RETRACT_FINAL.eventId, 'rejected']]);
@@ -250,11 +284,11 @@ function oracle(f: Feed) {
     statuses.set(m.eventId, 'applied');
   }
 
-  // Expected endpoint responses. Finalized = the effect of applied events at height <= frontier - 12.
+  // Expected endpoint responses. Finalized = the effect of applied events at height <= finalizedThrough.
   const finalized = new Map<string, bigint>();
-  applied.filter((m) => m.height <= frontier - 12).forEach((m) => applyTo(finalized, new Map(), m));
+  applied.filter((m) => m.height <= finalizedThrough).forEach((m) => applyTo(finalized, new Map(), m));
   const waitingCount = [...statuses.values()].filter((s) => s === 'waiting').length;
-  const header = { appliedThrough: String(frontier), gapAt: waitingCount ? String(frontier + 1) : null, waitingCount };
+  const header = { appliedThrough: String(frontier), finalizedThrough: String(finalizedThrough), gapAt: waitingCount ? String(frontier + 1) : null, waitingCount };
   const figures = (key: string) => {
     const fin = finalized.get(key) ?? 0n;
     const provisional = (holdings.get(key) ?? 0n) - fin;
@@ -277,6 +311,7 @@ async function invariants(ledger: Ledger): Promise<string[]> {
   const out: string[] = [];
   for (const assetId of ASSETS) {
     const h = await ledger.holders(assetId);
+    if (h.finalizedThrough > h.appliedThrough) out.push(`finalized through ${h.finalizedThrough} is above the frontier ${h.appliedThrough}`);
     let total = 0n;
     for (const x of h.holders) {
       if (x.finalized + x.provisional < 0n) out.push(`negative holding ${assetId}/${x.investorId}: ${x.finalized + x.provisional}`);
@@ -310,10 +345,12 @@ const hooks: Hooks = {
   },
 };
 
-async function runScenario(seed: number, protections: Partial<Protections>, pools: pg.Pool[]): Promise<string[]> {
+async function runScenario(seed: number, protections: Partial<Protections>, pools: pg.Pool[]) {
   await resetDb(0n, protections);
   const f = makeFeed(seed);
-  const inst = pools.map((p) => new Ledger(p, protections, hooks));
+  const inst = pools.map((p, i) => new Ledger(p, protections, hooks, `node-${i + 1}`));
+  note(`seed ${seed}, switched off: ${Object.keys(protections).join(', ') || 'none'}. RETRACT will be from height ${f.fromHeight}; `
+    + `${f.slow.map((m) => m.eventId).join(' and ')} will still be in flight when it arrives`);
   const problems = new Set<string>();
   const fail = (where: string) => (err: Error) => { problems.add(`${where} error: ${err.message}`); };
   const send = (l: Ledger, m: object) => l.ingest(m).then(() => l.drain()).then(() => {}, fail('ingest/drain'));
@@ -348,6 +385,7 @@ async function runScenario(seed: number, protections: Partial<Protections>, pool
   try {
     // Phase 1: every original except the slow ones, delivered and committed.
     const slowIds = new Set(f.slow.map((m) => m.eventId));
+    note('phase 1: originals delivered shuffled, 1-3 times each, some copies to both instances at once');
     await runJobs(deliveries(f.originals.filter((m) => !slowIds.has(m.eventId))));
 
     // Phase 2: hold the slow first deliveries open at their commit point, then send the RETRACT (duplicated,
@@ -358,21 +396,25 @@ async function runScenario(seed: number, protections: Partial<Protections>, pool
     const slow = f.slow.map((m) => {
       let reached!: () => void;
       const arrived = new Promise<void>((r) => { reached = r; });
-      const done = held.run(async () => { reached(); await gate; }, () => inst[0].ingest(m)).then(() => inst[0].drain(), fail('slow ingest'));
+      const done = held.run(async () => { note(`${m.eventId} reached its commit point and is held open`); reached(); await gate; }, () => inst[0].ingest(m)).then(() => inst[0].drain(), fail('slow ingest'));
       return { arrived: Promise.race([arrived, done]), done };
     });
     await Promise.all(slow.map((s) => s.arrived));
+    note(`phase 2: RETRACT from ${f.fromHeight} sent to both instances while redeliveries and drains run`);
     const retracting = Promise.all(Array.from({ length: f.int(2, 3) }, (_, k) => send(inst[k % 2], f.retraction)));
     const redelivering = runJobs(f.shuffle(f.originals.map((m): Job => [[inst[f.int(0, 1)], m]])).slice(0, 12));
     await Promise.race([retracting, sleep(50)]);
+    note('releasing the held ingests');
     release();
     await Promise.all([retracting, redelivering, ...slow.map((s) => s.done)]);
 
     // Phase 3: the corrected sequence plus stale redeliveries of retracted originals, then quiesce. Last, a
     // RETRACT that reaches final heights, which must change nothing.
     const stale = f.originals.filter((m) => m.height >= f.fromHeight).map((m): Job => [[inst[f.int(0, 1)], m]]);
+    note('phase 3: corrected sequence plus stale redeliveries of the retracted originals');
     await runJobs(f.shuffle([...deliveries(f.corrected), ...stale]));
     await quiesce();
+    note(`a RETRACT from ${RETRACT_FINAL.fromHeight} reaches final heights; both instances must reject it`);
     await Promise.all([send(inst[0], RETRACT_FINAL), send(inst[1], RETRACT_FINAL)]);
     await quiesce();
   } catch (err) {
@@ -383,8 +425,17 @@ async function runScenario(seed: number, protections: Partial<Protections>, pool
   }
 
   // Final state against invariants and the single-threaded oracle.
+  note('checking the final state against the invariants and the oracle');
   for (const v of await invariants(inst[0]).catch((e) => [`reader error: ${e.message}`])) problems.add(`final ${v}`);
-  const want = oracle(f);
+  // The finality line is the highest frontier ever reached, minus 12. How far the drains got before the RETRACT
+  // took the frontier lock depends on timing, so check the line is in its possible range, then require every
+  // endpoint figure to be exact for it.
+  const { rows: [line] } = await pool.query('SELECT finalized_through FROM ledger_state');
+  const finalizedThrough = BigInt(line.finalized_through);
+  const want = oracle(f, finalizedThrough);
+  const lowest = BigInt(want.frontier) - 12n;
+  const highest = BigInt(Math.max(HEIGHTS, want.frontier)) - 12n;
+  if (finalizedThrough < lowest || finalizedThrough > highest) problems.add(`finalized through ${finalizedThrough}, expected ${lowest}..${highest}`);
   const { rows: holdings } = await pool.query('SELECT asset_id, investor_id, units FROM holdings WHERE units <> 0');
   const stored = new Map(holdings.map((h) => [`${h.asset_id}/${h.investor_id}`, BigInt(h.units)]));
   diff('holding', new Map([...want.holdings].filter(([, u]) => u !== 0n)), stored, problems);
@@ -412,7 +463,10 @@ async function runScenario(seed: number, protections: Partial<Protections>, pool
     }
   }
   await app.close();
-  return [...problems];
+  const counts = inst.map((l) => `${l.name}: acks ${JSON.stringify(l.counters.ingests)}, applied ${l.counters.eventsApplied}, `
+    + `retractions ${l.counters.retractionsApplied} applied / ${l.counters.retractionsRejected} rejected, alerts ${JSON.stringify(l.counters.alerts)}`);
+  const summary = `frontier ${state.frontier}, finalized through ${finalizedThrough}\n    ${counts.join('\n    ')}`;
+  return { problems: [...problems], summary };
 }
 
 describe('concurrency: retraction racing shuffled duplicated delivery on two instances', () => {
@@ -422,7 +476,8 @@ describe('concurrency: retraction racing shuffled duplicated delivery on two ins
 
   it('matches the oracle and holds every invariant with all protections on', async () => {
     for (const seed of PASS_SEEDS) {
-      const problems = await runScenario(seed, {}, pools);
+      const { problems, summary } = await runScenario(seed, {}, pools);
+      print(`seed ${seed}: ${problems.length ? 'FAIL' : 'ok'}, ${summary}`);
       if (problems.length) print(`FAIL seed ${seed}:\n  ${problems.slice(0, 10).join('\n  ')}`);
       expect(problems, `seed ${seed}`).toEqual([]);
     }
@@ -432,9 +487,10 @@ describe('concurrency: retraction racing shuffled duplicated delivery on two ins
   it.each(Object.keys(ALL_PROTECTIONS))('breaks when %s is switched off', async (name) => {
     for (let round = 1; round <= ROUNDS; round++) {
       const seed = 1000 + round;
-      const problems = await runScenario(seed, { [name]: false }, pools);
+      const { problems, summary } = await runScenario(seed, { [name]: false }, pools);
       if (problems.length) {
-        print(`${name} off -> failed in round ${round} (seed ${seed}), ${problems.length} problem(s), e.g.\n  ${problems.slice(0, 3).join('\n  ')}`);
+        print(`${name} off -> failed in round ${round} (seed ${seed}), ${problems.length} problem(s), e.g.\n  ${problems.slice(0, 3).join('\n  ')}`
+          + `\n  ${summary}`);
         return;
       }
     }

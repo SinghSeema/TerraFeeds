@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
 import type pg from 'pg';
 import { tx } from './db.js';
 
@@ -78,7 +79,7 @@ function rowToEvent(r: any): Event {
 
 export class Ledger {
   readonly counters = {
-    duplicatesIgnored: 0, drains: 0, eventsApplied: 0, retractionsApplied: 0, retractionsRejected: 0,
+    ingests: {} as Record<string, number>, drains: 0, eventsApplied: 0, retractionsApplied: 0, retractionsRejected: 0,
     alerts: {} as Record<string, number>,
   };
   private readonly protections: Protections;
@@ -89,20 +90,35 @@ export class Ledger {
   private readonly lagCritical = BigInt(process.env.LAG_CRITICAL ?? '10');
   private readonly stallMs = Number(process.env.STALL_SECONDS ?? '300') * 1000;
 
-  constructor(private readonly pool: pg.Pool, protections: Partial<Protections> = {}, private readonly hooks: Hooks = {}) {
+  constructor(
+    private readonly pool: pg.Pool, protections: Partial<Protections> = {}, private readonly hooks: Hooks = {},
+    readonly name = process.env.INSTANCE_NAME ?? hostname(),
+  ) {
     this.protections = { ...ALL_PROTECTIONS, ...protections };
+  }
+
+  // One JSON line per entry, tagged with the instance so interleaved logs from several servers stay readable.
+  private log(level: 'info' | 'alert', msg: string, detail: Record<string, unknown> = {}) {
+    console.log(json({ time: new Date().toISOString(), level, instance: this.name, msg, ...detail }));
   }
 
   alert(type: string, detail: Record<string, unknown>) {
     this.counters.alerts[type] = (this.counters.alerts[type] ?? 0) + 1;
-    console.log(json({ level: 'alert', type, ...detail }));
+    this.log('alert', type, detail);
   }
 
   // The caller acks only after this resolves, i.e. after commit, and then triggers drain().
   async ingest(message: unknown): Promise<'accepted' | 'duplicate' | 'replaced' | 'conflict' | 'applied' | 'rejected'> {
     const e = parseMessage(message);
     const hash = contentHash(e);
-    if (e.kind === 'retract') return this.retract(e, hash);
+    const outcome = e.kind === 'retract' ? await this.retract(e, hash) : await this.ingestTransfer(e, hash);
+    this.counters.ingests[outcome] = (this.counters.ingests[outcome] ?? 0) + 1;
+    // Logged after commit, so this line marks exactly when the message may be acked.
+    this.log('info', 'ack', { eventId: e.eventId, height: e.height ?? undefined, fromHeight: e.fromHeight ?? undefined, outcome });
+    return outcome;
+  }
+
+  private ingestTransfer(e: Event, hash: string) {
     return tx(this.pool, async (c) => {
       // Shared barrier: ingests run in parallel with each other, but a retraction waits for every in-flight
       // ingest to commit (so its sweep sees them) and holds new ones off until its rewind commits.
@@ -137,7 +153,6 @@ export class Ledger {
         await c.query(`UPDATE events SET status = 'waiting' WHERE event_id = $1`, [e.eventId]);
         return 'accepted';
       }
-      this.counters.duplicatesIgnored++;
       return 'duplicate';
     }
     if (row.status === 'retracted' && e.kind === 'transfer') {
@@ -148,7 +163,7 @@ export class Ledger {
          WHERE event_id = $1 AND status = 'retracted'`,
         [e.eventId, e.height, e.assetId, e.from, e.to, e.units, hash].map(param),
       );
-      console.log(json({ level: 'info', msg: 'retracted id reused with new content', eventId: e.eventId }));
+      this.log('info', 'retracted id reused with new content', { eventId: e.eventId });
       return 'replaced';
     }
     this.alert('live_row_conflict', { eventId: e.eventId, status: row.status });
@@ -157,18 +172,20 @@ export class Ledger {
 
   private async readState(c: pg.PoolClient, forUpdate: boolean) {
     const { rows: [s] } = await c.query(
-      `SELECT frontier, blocked_at FROM ledger_state WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}`,
+      `SELECT frontier, finalized_through, blocked_at FROM ledger_state WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}`,
     );
-    return { frontier: BigInt(s.frontier), blockedAt: big(s.blocked_at) };
+    return { frontier: BigInt(s.frontier), finalizedThrough: BigInt(s.finalized_through), blockedAt: big(s.blocked_at) };
   }
 
   private async saveState(c: pg.PoolClient, frontier: bigint, blockedAt: bigint | null, reason: string | null) {
     // highest_seen is refreshed on every drain stop too, so the lag alert sees heights waiting behind a gap.
+    // finalized_through only rises: a height once reported final stays final even when a retraction rewinds the frontier.
     await c.query(
       `UPDATE ledger_state SET frontier = $1, blocked_at = $2, blocked_reason = $3,
+         finalized_through = GREATEST(finalized_through, $1::bigint - $4),
          highest_seen = GREATEST($1::bigint, (SELECT max(height) FROM events WHERE status IN ('waiting', 'applied')))
        WHERE id = 1`,
-      [frontier, blockedAt, reason].map(param),
+      [frontier, blockedAt, reason, FINALITY_DEPTH].map(param),
     );
   }
 
@@ -205,13 +222,17 @@ export class Ledger {
 
   async drain(): Promise<number> {
     this.counters.drains++;
-    let applied = 0;
-    while (await this.applyNext()) applied++;
-    return applied;
+    for (let applied = 0; ; applied++) {
+      const e = await this.applyNext();
+      if (!e) return applied;
+      this.counters.eventsApplied++;
+      // After commit, so the log never shows an apply that was rolled back.
+      this.log('info', 'applied', { eventId: e.eventId, height: e.height, assetId: e.assetId, from: e.from, to: e.to, units: e.units });
+    }
   }
 
   // One event per transaction: a failure loses only the event in flight, and the lock is held briefly.
-  private applyNext(): Promise<boolean> {
+  private applyNext(): Promise<Event | null> {
     return tx(this.pool, async (c) => {
       // Frontier lock: serializes every writer of holdings and frontier across all instances, so two drains
       // cannot apply the same height twice. Under READ COMMITTED each later statement sees what the previous
@@ -223,7 +244,7 @@ export class Ledger {
       );
       if (rows.length === 0) {
         await this.saveState(c, state.frontier, null, null);
-        return false;
+        return null;
       }
       if (rows.length > 1) return this.block(c, state, 'multiple_events_at_height', { eventIds: rows.map((r) => r.event_id) });
       const e = rowToEvent(rows[0]);
@@ -241,8 +262,7 @@ export class Ledger {
       await c.query(`UPDATE events SET status = 'applied', applied_at = now() WHERE event_id = $1`, [e.eventId]);
       await this.saveState(c, next, null, null);
       await this.hooks.beforeCommit?.();
-      this.counters.eventsApplied++;
-      return true;
+      return e;
     });
   }
 
@@ -251,22 +271,27 @@ export class Ledger {
     const next = state.frontier + 1n;
     if (state.blockedAt !== next) this.alert(type, { height: next, ...detail });
     await this.saveState(c, state.frontier, next, type);
-    return false;
+    return null;
   }
 
   private retract(e: Event, hash: string) {
     return tx(this.pool, async (c) => {
       // Lock order is always advisory, then ledger_state row. The exclusive barrier waits for in-flight
       // ingests, so every event is either swept below or arrives after the rewind has committed.
+      const waitStart = Date.now();
+      this.log('info', 'retraction waiting for in-flight ingests', { eventId: e.eventId, fromHeight: e.fromHeight });
       await c.query('SELECT pg_advisory_xact_lock($1)', [INGEST_BARRIER]);
+      this.log('info', 'retraction holds the barrier', { eventId: e.eventId, waitedMs: Date.now() - waitStart });
       if (!(await this.insertOnce(c, e, hash))) return this.resolveExisting(c, e, hash);
       // Frontier lock: no drain may apply while holdings are being rewound.
       const state = await this.readState(c, true);
       const fromHeight = e.fromHeight!;
-      if (this.protections.finalityGuard && fromHeight <= state.frontier - FINALITY_DEPTH) { // test-only switch
+      // Compared with the stored high-water mark, not frontier - 12: an earlier rewind lowers the frontier, and a
+      // second retraction must still not reach heights that were already reported final.
+      if (this.protections.finalityGuard && fromHeight <= state.finalizedThrough) { // test-only switch
         await c.query(`UPDATE events SET status = 'rejected' WHERE event_id = $1`, [e.eventId]);
         this.counters.retractionsRejected++;
-        this.alert('retraction_rejected_final', { eventId: e.eventId, fromHeight, frontier: state.frontier });
+        this.alert('retraction_rejected_final', { eventId: e.eventId, fromHeight, finalizedThrough: state.finalizedThrough });
         return 'rejected';
       }
       // No row lock needed: the barrier and the frontier lock already exclude every other writer of these rows.
@@ -286,7 +311,9 @@ export class Ledger {
       await this.saveState(c, frontier, null, null);
       await this.hooks.beforeCommit?.();
       this.counters.retractionsApplied++;
-      console.log(json({ level: 'info', msg: 'retraction applied', eventId: e.eventId, fromHeight, swept: rows.length, frontier }));
+      this.log('info', 'retraction rewinding', {
+        eventId: e.eventId, fromHeight, undone: rows.filter((r) => r.status === 'applied').length, swept: rows.length, frontier,
+      });
       return 'applied';
     });
   }
@@ -294,19 +321,19 @@ export class Ledger {
   // Header shared by both read endpoints; must run inside the caller's snapshot transaction.
   private async readHeader(c: pg.PoolClient) {
     const { rows: [s] } = await c.query(
-      `SELECT s.frontier, s.blocked_at, count(e.event_id) AS waiting,
+      `SELECT s.frontier, s.finalized_through, s.blocked_at, count(e.event_id) AS waiting,
               count(e.event_id) FILTER (WHERE e.height > s.frontier) AS waiting_above
        FROM ledger_state s LEFT JOIN events e ON e.status = 'waiting'
-       WHERE s.id = 1 GROUP BY s.frontier, s.blocked_at`,
+       WHERE s.id = 1 GROUP BY s.frontier, s.finalized_through, s.blocked_at`,
     );
     const frontier = BigInt(s.frontier);
     const gapAt = big(s.blocked_at) ?? (Number(s.waiting_above) > 0 ? frontier + 1n : null);
-    return { appliedThrough: frontier, gapAt, waitingCount: Number(s.waiting) };
+    return { appliedThrough: frontier, finalizedThrough: BigInt(s.finalized_through), gapAt, waitingCount: Number(s.waiting) };
   }
 
-  // Provisional = net change from applied events above frontier - 12; finalized = balance - provisional.
+  // Provisional = net change from applied events above finalized_through; finalized = balance - provisional.
   // `column` is one of two typed literals, never request input, so interpolating it is safe.
-  private async positionRows(c: pg.PoolClient, frontier: bigint, column: 'asset_id' | 'investor_id', id: string) {
+  private async positionRows(c: pg.PoolClient, finalizedThrough: bigint, column: 'asset_id' | 'investor_id', id: string) {
     const { rows } = await c.query(
       `SELECT h.asset_id, h.investor_id, h.units, coalesce(sum(d.delta), 0) AS provisional
        FROM holdings h LEFT JOIN (
@@ -319,7 +346,7 @@ export class Ledger {
        WHERE h.${column} = $2
        GROUP BY h.asset_id, h.investor_id, h.units
        ORDER BY h.asset_id, h.investor_id`,
-      [(frontier - FINALITY_DEPTH).toString(), id],
+      [finalizedThrough.toString(), id],
     );
     return rows
       .map((r) => ({ assetId: r.asset_id as string, investorId: r.investor_id as string, balance: BigInt(r.units), provisional: BigInt(r.provisional) }))
@@ -331,7 +358,7 @@ export class Ledger {
     return tx(this.pool, async (c) => {
       const header = await this.readHeader(c);
       const { rows: [a] } = await c.query('SELECT issued_supply FROM assets WHERE asset_id = $1', [assetId]);
-      const rows = await this.positionRows(c, header.appliedThrough, 'asset_id', assetId);
+      const rows = await this.positionRows(c, header.finalizedThrough, 'asset_id', assetId);
       return {
         assetId, issuedSupply: a ? BigInt(a.issued_supply) : 0n, ...header,
         holders: rows.map((r) => ({ investorId: r.investorId, finalized: r.finalized, provisional: r.provisional })),
@@ -342,7 +369,7 @@ export class Ledger {
   positions(investorId: string) {
     return tx(this.pool, async (c) => {
       const header = await this.readHeader(c);
-      const rows = await this.positionRows(c, header.appliedThrough, 'investor_id', investorId);
+      const rows = await this.positionRows(c, header.finalizedThrough, 'investor_id', investorId);
       return {
         investorId, ...header,
         positions: rows.map((r) => ({ assetId: r.assetId, finalized: r.finalized, provisional: r.provisional })),
@@ -414,12 +441,12 @@ export class Ledger {
 
   async metrics() {
     const { rows: [s] } = await this.pool.query(
-      `SELECT frontier, highest_seen,
+      `SELECT frontier, finalized_through, highest_seen,
          (SELECT extract(epoch FROM now() - min(received_at)) FROM events WHERE status = 'waiting') AS oldest_waiting
        FROM ledger_state WHERE id = 1`,
     );
     return {
-      ...this.counters, frontier: BigInt(s.frontier), highestSeen: BigInt(s.highest_seen),
+      ...this.counters, frontier: BigInt(s.frontier), finalizedThrough: BigInt(s.finalized_through), highestSeen: BigInt(s.highest_seen),
       oldestWaitingAgeSeconds: s.oldest_waiting === null ? null : Number(s.oldest_waiting),
     };
   }

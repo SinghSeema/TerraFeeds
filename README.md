@@ -29,20 +29,21 @@ curl -XPOST localhost:3000/events -H 'content-type: application/json' \
 
 ```
 GET /assets/FUND-A/holders
-{"assetId":"FUND-A","issuedSupply":"1000","appliedThrough":"4471","gapAt":"4472","waitingCount":1,
+{"assetId":"FUND-A","issuedSupply":"1000","appliedThrough":"4471","finalizedThrough":"4459","gapAt":"4472","waitingCount":1,
  "holders":[{"investorId":"alice","finalized":"0","provisional":"1000"}]}
 
 GET /investors/alice/positions
-{"investorId":"alice","appliedThrough":"4473","gapAt":null,"waitingCount":0,
+{"investorId":"alice","appliedThrough":"4473","finalizedThrough":"4461","gapAt":null,"waitingCount":0,
  "positions":[{"assetId":"FUND-A","finalized":"0","provisional":"650"}]}
 ```
 
 - `appliedThrough` is the frontier: the highest height applied with no gap below it.
+- `finalizedThrough` is the finality line: applied events at or below it are in `finalized`, the rest in `provisional`. It never goes down.
 - `gapAt` is the height the ledger is stuck on, if any.
 - `waitingCount` is the number of events received but not yet applied. They appear in neither figure.
 - Units are returned as strings so no client parses them into a lossy float.
 
-`GET /metrics` returns JSON counters: duplicates ignored, alerts by type, drains, events applied, retractions applied and rejected, `frontier`, `highestSeen`, and `oldestWaitingAgeSeconds`. `GET /health` returns `{"ok":true}`.
+`GET /metrics` returns JSON counters: acks by outcome, alerts by type, drains, events applied, retractions applied and rejected, `frontier`, `finalizedThrough`, `highestSeen`, and `oldestWaitingAgeSeconds`. `GET /health` returns `{"ok":true}`.
 
 To replay the gap demo from the plan, start the API with `GENESIS_FRONTIER=4470 docker compose up -d --build`. Then post 4471, then 4473 (`gapAt` is 4472), then 4472.
 
@@ -56,16 +57,17 @@ To replay the gap demo from the plan, start the API with `GENESIS_FRONTIER=4470 
   |---|---|---|
   | `retracted` (a tombstone) | ignored | replaced as a new `waiting` event |
   | `waiting` or `applied` | ignored | left unchanged, `live_row_conflict` alert |
-- **Retraction** takes the exclusive advisory lock, then the frontier lock. It undoes applied events newest-first, so no holder goes negative even briefly, and tombstones every event it sweeps. It then rewinds the frontier to `fromHeight - 1`. A retraction that reaches final heights is rejected with an alert.
+- **Retraction** takes the exclusive advisory lock, then the frontier lock. It undoes applied events newest-first, so no holder goes negative even briefly, and tombstones every event it sweeps. It then rewinds the frontier to `fromHeight - 1`. A retraction that reaches final heights (`fromHeight <= finalized_through`) is rejected with an alert.
 - **The ingest barrier.** Transfer ingest holds the same advisory lock in shared mode. A retraction therefore waits for every ingest already in flight, and its sweep sees it. Ingests that start later wait until the rewind has committed.
 - **Lock order is always the advisory lock first, then the `ledger_state` row.** The drain takes only the row lock, so the two can never wait on each other in a cycle.
-- **Finalized and provisional are computed at read time.** An applied event is finalized when `height <= frontier - 12`. `provisional` is the net change from applied events above that line, and `finalized` is the balance minus provisional. Both reads run in one `REPEATABLE READ, READ ONLY` transaction, so the header and the figures come from one snapshot.
+- **Finality never goes backwards.** `ledger_state.finalized_through` is the highest `frontier - 12` the ledger has ever reached; every frontier write raises it with `GREATEST`, nothing lowers it. An applied event is finalized when `height <= finalized_through`. The line is stored, not computed from the current frontier, because a retraction rewinds the frontier: a line computed from it would drop too. A client would then see a `finalized` figure go down, and a second RETRACT could reach heights already reported final. The retraction guard and the reads use the same stored line. The guard keeps `frontier >= finalized_through`, so every height up to the line is applied.
+- **Finalized and provisional amounts are computed at read time.** `provisional` is the net change from applied events above the line, and `finalized` is the balance minus provisional. Both reads run in one `REPEATABLE READ, READ ONLY` transaction, so the header and the figures come from one snapshot.
 - **The drain runs after every ingest and on a 1s timer on every instance.** Two drains racing is safe: the second blocks on the frontier lock, then re-reads the frontier.
 - **`reconcile()`** replays all applied events in memory and compares the result with `holdings` and `issued_supply`. The test calls it. In production it would run hourly and after every retraction; it is not scheduled here.
 
 ### Alerts
 
-`alert(type, detail)` increments a counter and writes one JSON log line. Lag and stall alerts fire once when their condition starts, then again only after it has cleared.
+Every log line is one JSON object: `{time, level, instance, msg, ...}`. `instance` is `INSTANCE_NAME` (default: the host name, `api-1` in Compose), so logs from several servers can be interleaved and still read. The service logs `ack` (after commit, with the outcome), `applied` (after commit), and a retraction's `waiting for in-flight ingests`, `holds the barrier` (with `waitedMs`) and `rewinding` steps. `alert(type, detail)` increments a counter and writes one line with `level: "alert"`. Lag and stall alerts fire once when their condition starts, then again only after it has cleared.
 
 | Type | When |
 |---|---|
@@ -86,13 +88,14 @@ To replay the gap demo from the plan, start the API with `GENESIS_FRONTIER=4470 
 
 ## The test
 
-`test/concurrency.test.ts` has 7 small deterministic tests and one concurrency scenario.
+`test/concurrency.test.ts` has 8 small deterministic tests and one concurrency scenario.
 
 **Deterministic tests:**
 - out-of-order apply (4472 before 4471);
 - a gap holds, and the endpoints report it;
 - a negative balance stops the drain and alerts once;
 - a retraction is rejected at `frontier - 12` but accepted at `frontier - 11`;
+- after that rewind, no `finalized` figure goes down, and a second RETRACT reaching a height that was final before the rewind is rejected;
 - the same-id, different-content rules;
 - lag and stall alerts;
 - the finalized/provisional split at the `frontier - 12` boundary.
@@ -140,6 +143,7 @@ A reader loop checks invariants throughout, through the endpoint handlers:
 The final state must also satisfy:
 - `finalized + provisional` equals the stored balance for every holder;
 - it matches a single-threaded oracle: holdings, issued supply, frontier, and every event's status;
+- `finalizedThrough` is never above the frontier (also checked mid-run). It equals the highest frontier reached minus 12. How far the drains got before the RETRACT took the frontier lock depends on timing, so the test checks it lies in its possible range (`final frontier - 12` to `max(40, final frontier) - 12`). Every endpoint figure must then be exact for that line;
 - `GET /assets/{assetId}/holders` and `GET /investors/{investorId}/positions` return exactly what the oracle expects for every asset and investor. That covers every field: the finalized/provisional split, `appliedThrough`, `gapAt` and `waitingCount`.
 
 **Must-fail proofs.** The scenario then reruns with each protection switched off, for up to `ROUNDS` (25) seeds, and asserts that at least one round breaks:
@@ -156,10 +160,35 @@ The final state must also satisfy:
 Each switch is one `if` at the exact spot it guards, marked `test-only switch`, and all default to on. The only other test hook is `hooks.beforeCommit`, a yield the test uses to add jitter and to hold an ingest open.
 
 **Reading the output.**
-- A passing run prints `all protections on: seeds 1,2,3,4,5 match the oracle, no invariant broken`.
-- Each switch prints a line like `frontierLock off -> failed in round 1 (seed 1001), 81 problem(s), e.g. ...`, followed by the first mismatches as evidence.
+- Each passing seed prints a summary, per instance, of what happened:
+  ```
+  seed 1: ok, frontier 34, finalized through 23
+      node-1: acks {"accepted":24,"duplicate":49,"applied":1}, applied 17, retractions 1 applied / 0 rejected, alerts {"negative_balance_block":1}
+      node-2: acks {"accepted":22,"duplicate":36,"rejected":1}, applied 23, retractions 0 applied / 1 rejected, alerts {"retraction_rejected_final":1}
+  ```
+  Then `all protections on: seeds 1,2,3,4,5 match the oracle, no invariant broken`.
+- Each switch prints a line like `frontierLock off -> failed in round 1 (seed 1001), 81 problem(s), e.g. ...`, followed by the first mismatches as evidence and the same per-instance summary.
 - If the passing run fails, the output prints `FAIL seed N` and the problems.
 - To replay particular seeds, run `SEEDS=7,8 npm test`. To change the number of must-fail rounds, set `ROUNDS`.
+- To watch one run as it happens, set `LOG=1`. The service log lines are printed as `time instance message key=value`, between the scenario's phase notes. One seed is about 200 lines:
+  ```
+  LOG=1 SEEDS=1 npx vitest run -t "all protections"        # everything working
+  LOG=1 npx vitest run -t "ingestBarrier is switched off"   # one protection off, until it breaks
+  ```
+  ```
+  ---- phase 2: RETRACT from 30 sent to both instances while redeliveries and drains run
+  14:43:54.315 node-1 retraction waiting for in-flight ingests eventId=r-main fromHeight=30
+  14:43:54.316 node-2 retraction waiting for in-flight ingests eventId=r-main fromHeight=30
+  ---- releasing the held ingests
+  14:43:54.366 node-1 ack eventId=o33 height=33 outcome=accepted
+  14:43:54.367 node-1 ack eventId=o35 height=35 outcome=accepted
+  14:43:54.367 node-1 retraction holds the barrier eventId=r-main waitedMs=52
+  ...
+  14:43:54.413 node-1 retraction rewinding eventId=r-main fromHeight=30 undone=7 swept=11 frontier=29
+  14:43:54.417 node-1 ack eventId=r-main fromHeight=30 outcome=applied
+  14:43:54.421 node-2 retraction holds the barrier eventId=r-main waitedMs=105
+  14:43:54.424 node-2 ack eventId=r-main fromHeight=30 outcome=duplicate
+  ```
 - Every switch currently fails in round 1. In a 10-seed sample per switch, every switch failed every seed. The passing scenario has been run clean over 40 seeds.
 
 ## Open decisions
@@ -167,6 +196,7 @@ Each switch is one `if` at the exact spot it guards, marked `test-only switch`, 
 - **Message format.** Exactly the feed's two shapes. A transfer has no `type` field: `{eventId, height, assetId, from, to, units}`. A retraction is `{eventId, type: "RETRACT", fromHeight}`. Any other `type` is rejected with 400.
 - **`highest_seen`** is refreshed by the drain, both when it applies an event and when it stops, and by retraction. Ingest stays insert-only. If it were refreshed only on apply, it would never move at a gap and the lag alert could not fire.
 - **A retraction that finds nothing in range** still succeeds and rewinds nothing.
+- **The finality line is stored.** The original rule was "finalized is computed at read time, never stored". The amounts still are, but the line (`finalized_through`) is stored, because a line computed as `frontier - 12` moves down when a retraction rewinds the frontier. It starts at 0 and only rises.
 - **Units** are integers (`bigint`) end to end.
 - **A retracted id that comes back with new content** is overwritten in place, and the log line records the reuse. History is kept by not deleting rows, not by keeping every version.
 - **Alert counters are incremented inside the transaction.** A rollback after an alert would still leave it counted.

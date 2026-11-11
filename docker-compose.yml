@@ -19,6 +19,7 @@ services:
     environment:
       DATABASE_URL: postgres://ledger:ledger@db:5432/ledger
       GENESIS_FRONTIER: ${GENESIS_FRONTIER:-0}
+      INSTANCE_NAME: ${INSTANCE_NAME:-api-1}
     ports:
       - "${API_PORT:-3000}:3000"
     depends_on:

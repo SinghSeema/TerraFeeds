@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS ledger_state (
   blocked_at     bigint,
   blocked_reason text
 );
+-- Highest height ever finalized. Only rises: a rewind lowers the frontier, but never what was declared final.
+-- Added in place so a database created before this column upgrades on the next start.
+ALTER TABLE ledger_state ADD COLUMN IF NOT EXISTS finalized_through bigint NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS assets (
   asset_id      text PRIMARY KEY,
